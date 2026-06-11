@@ -1,0 +1,9 @@
+*.exe
+*.csv
+*.mat
+*.pdf
+*.png
+vio_benchmark
+figures/
+MH_02_easy/
+MH_03_medium/
