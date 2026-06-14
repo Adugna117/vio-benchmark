@@ -1,7 +1,8 @@
 #pragma once
 // =============================================================================
 // full_ukf.hpp  –  Full 15-state Unscented Kalman Filter
-//                  Port of run_full_ukf.m
+//                  
+//                  (continuous-time to discrete-time conversion)
 // =============================================================================
 #include <cstdio>
 #include <cmath>
@@ -91,13 +92,9 @@ inline SigmaMat sigma_points(const Mat15& P, double alpha=0.1, double kappa=0.0)
     double lam=alpha*alpha*(n+kappa)-n;
     double scale=std::sqrt(n+lam);
 
-    // Scale each col of cholesky by scale
     Mat15 L=chol15(P);
     SigmaMat S{};
-    // S[0] = mean = 0
     for(int k=0;k<UKF_N;k++){
-        // S[k+1]  = +scale * col_k(L)
-        // S[k+1+N]= -scale * col_k(L)
         for(int i=0;i<UKF_N;i++){
             S[k+1][i]       = +scale*L[i][k];
             S[k+1+UKF_N][i] = -scale*L[i][k];
@@ -106,57 +103,46 @@ inline SigmaMat sigma_points(const Mat15& P, double alpha=0.1, double kappa=0.0)
     return S;
 }
 
-// ── Process model:  propagate one sigma point (15-dim) ────────────────────────
-// xi = error-state sigma point  (phi,p,v,bg,ba)
-// nominal state (R,p,v,bg,ba) passed via references
-// Returns propagated sigma point
-inline std::array<double,UKF_N> ukf_process(
-    const std::array<double,UKF_N>& xi,
-    const Vec3& p_nom, const Vec3& v_nom,
-    const Vec4& q_nom, const Mat3& R_nom,
-    const Vec3& bg_nom, const Vec3& ba_nom,
-    Vec3 omega_raw, Vec3 acc_raw, double dt)
-{
-    static const Vec3 gw={0,0,-9.81};
-
-    // Recover perturbed state
-    Vec3 phi={xi[0],xi[1],xi[2]};
-    Vec3 p={p_nom[0]+xi[3], p_nom[1]+xi[4], p_nom[2]+xi[5]};
-    Vec3 v={v_nom[0]+xi[6], v_nom[1]+xi[7], v_nom[2]+xi[8]};
-    Vec3 bg={bg_nom[0]+xi[9],  bg_nom[1]+xi[10], bg_nom[2]+xi[11]};
-    Vec3 ba={ba_nom[0]+xi[12], ba_nom[1]+xi[13], ba_nom[2]+xi[14]};
-
-    // Perturb rotation
-    Mat3 R=R_nom*expm_so3(phi);
-
-    Vec3 omega_c=omega_raw-bg;
-    Vec3 acc_c=acc_raw-ba;
-
-    // Propagate
-    Mat3 dR=expm_so3(omega_c*dt);
-    Mat3 R_new=R*dR;
-    Vec3 a_world=R*acc_c+gw;
-    Vec3 v_new=v+a_world*dt;
-    Vec3 p_new=p+v*dt+0.5*a_world*dt*dt;
-    Vec3 bg_new=bg;
-    Vec3 ba_new=ba;
-
-    // New phi relative to propagated nominal
-    // phi_new ≈ log(R_nom_new' * R_new)
-    // R_nom_new = R_nom * expm(omega_c_nom * dt)  but we use R_new itself
-    // → just return residual = 0 in orientation (nominal tracks mean)
-    std::array<double,UKF_N> xo{};
-    // phi_out = log( R_new * R_nom_new^{-1} ) but since we track around nominal
-    // just return the deltas
-    xo[0]=0; xo[1]=0; xo[2]=0; // orientation residual (absorbed into nominal)
-    xo[3]=p_new[0]; xo[4]=p_new[1]; xo[5]=p_new[2];
-    xo[6]=v_new[0]; xo[7]=v_new[1]; xo[8]=v_new[2];
-    xo[9]=bg_new[0]; xo[10]=bg_new[1]; xo[11]=bg_new[2];
-    xo[12]=ba_new[0]; xo[13]=ba_new[1]; xo[14]=ba_new[2];
-    return xo;
+// ─────────────────────────────────────────────────────────────────────────────
+// CORRECTED: Discrete-time process noise covariance Qd
+// IDENTICAL to ESKF (continuous-time to discrete-time conversion)
+// ─────────────────────────────────────────────────────────────────────────────
+inline Mat15 make_Qd_ukf(double dt){
+    double sg = 0.0002;   // gyro noise density (rad/s/√Hz)
+    double sa = 0.002;    // accelerometer noise density (m/s²/√Hz)
+    double sbg = 0.00001; // gyro bias random walk (rad/s²/√Hz)
+    double sba = 0.0001;  // accelerometer bias random walk (m/s³/√Hz)
+    
+    double dt2 = dt * dt;
+    double dt3 = dt2 * dt;
+    
+    Mat15 Qd = {};  // zero-initialized
+    
+    // 1. Orientation error: gyro noise
+    for(int i = 0; i < 3; i++) Qd[i][i] = sg * sg * dt;
+    
+    // 2. Velocity: acceleration noise (single integral)
+    for(int i = 0; i < 3; i++) Qd[6+i][6+i] = sa * sa * dt;
+    
+    // 3. Position: acceleration noise (double integral)
+    for(int i = 0; i < 3; i++) Qd[3+i][3+i] = sa * sa * dt3 / 3.0;
+    
+    // 4. Position-velocity cross-correlation (from same acceleration noise)
+    for(int i = 0; i < 3; i++) {
+        Qd[3+i][6+i] = sa * sa * dt2 / 2.0;
+        Qd[6+i][3+i] = Qd[3+i][6+i];
+    }
+    
+    // 5. Gyro bias random walk
+    for(int i = 0; i < 3; i++) Qd[9+i][9+i] = sbg * sbg * dt;
+    
+    // 6. Accel bias random walk
+    for(int i = 0; i < 3; i++) Qd[12+i][12+i] = sba * sba * dt;
+    
+    return Qd;
 }
 
-// ── ZUPT for UKF (reuse ESKF linear approach) ────────────────────────────────
+// ── ZUPT for UKF (identical to ESKF) ────────────────────────────────────────
 inline void ukf_zupt(UKFFullState& s, Vec3 omega_raw, Vec3 acc_raw){
     bool stat=(norm(omega_raw)<0.01)&&(std::abs(norm(acc_raw)-9.81)<0.05);
     if(!stat) return;
@@ -174,6 +160,7 @@ inline void ukf_zupt(UKFFullState& s, Vec3 omega_raw, Vec3 acc_raw){
     s.P=joseph_update(s.P,K,H,sig2);
 }
 
+// ── Gravity alignment for UKF (identical to ESKF) ───────────────────────────
 inline void ukf_gravity(UKFFullState& s, Vec3 acc_raw){
     if(std::abs(norm(acc_raw)-9.81)>=0.1) return;
     Vec3 g_meas=normalized(acc_raw);
@@ -195,19 +182,6 @@ inline void ukf_gravity(UKFFullState& s, Vec3 acc_raw){
     s.P=joseph_update(s.P,K,H,sig2);
 }
 
-// ── Process noise for UKF ────────────────────────────────────────────────────
-inline Mat15 make_Q_ukf(){
-    Mat15 Q;
-    for(int i=0;i<3;i++){
-        Q[i][i]     = 0.01*0.01;
-        Q[3+i][3+i] = 0.01*0.01;
-        Q[6+i][6+i] = 0.001*0.001;
-        Q[9+i][9+i] = 0.0001*0.0001;
-        Q[12+i][12+i]= 0.001*0.001;
-    }
-    return Q;
-}
-
 // ── Main Full UKF run ─────────────────────────────────────────────────────────
 inline FilterResult run_full_ukf(const AlignedData& ad){
     FilterResult res;
@@ -220,7 +194,6 @@ inline FilterResult run_full_ukf(const AlignedData& ad){
     UKFFullState s=ukf_full_init(ad);
     res.pos[0]=s.p; res.quat[0]=s.q;
 
-    Mat15 Q=make_Q_ukf();
     UKFWeights W=make_weights();
 
     int cam_idx=0;
@@ -245,10 +218,8 @@ inline FilterResult run_full_ukf(const AlignedData& ad){
         Vec3 acc_c=acc-s.b_a;
 
         // ─── UKF Predict ─────────────────────────────────────────────────────
-        // 1. Generate sigma points around ZERO (error state)
         SigmaMat SP=sigma_points(s.P);
 
-        // 2. Propagate each sigma point through nonlinear model
         SigmaMat SP_pred{};
         static const Vec3 gw={0,0,-9.81};
 
@@ -261,10 +232,8 @@ inline FilterResult run_full_ukf(const AlignedData& ad){
         Vec3 bg_pred=s.b_g, ba_pred=s.b_a;
         Vec4 q_pred_nom=rotm2quat(R_pred_nom);
 
-        // SP[0] stays zero (mean)
-        // For SP[1..30]: propagate perturbation
+        // Propagate each sigma point
         for(int k=1;k<UKF_L;k++){
-            // Perturb: extract phi, then compute perturbed rotation
             Vec3 phi_k={SP[k][0],SP[k][1],SP[k][2]};
             Vec3 dp_k={SP[k][3],SP[k][4],SP[k][5]};
             Vec3 dv_k={SP[k][6],SP[k][7],SP[k][8]};
@@ -304,12 +273,12 @@ inline FilterResult run_full_ukf(const AlignedData& ad){
             }
         }
 
-        // 3. Predicted mean (should be ~zero for error state)
+        // Predicted mean (should be ~zero for error state)
         std::array<double,UKF_N> xm{};
         for(int k=0;k<UKF_L;k++)
             for(int d=0;d<UKF_N;d++) xm[d]+=W.Wm[k]*SP_pred[k][d];
 
-        // 4. Predicted covariance + Q
+        // Predicted covariance
         Mat15 P_pred{};
         for(int k=0;k<UKF_L;k++){
             std::array<double,UKF_N> dx;
@@ -317,35 +286,36 @@ inline FilterResult run_full_ukf(const AlignedData& ad){
             for(int i=0;i<UKF_N;i++) for(int j=0;j<UKF_N;j++)
                 P_pred[i][j]+=W.Wc[k]*dx[i]*dx[j];
         }
-        P_pred=mat15_add(P_pred,mat15_scale(dt,Q));
-        P_pred=mat15_symmetrize(P_pred);
+
+        // ==============================================================
+        // CORRECTED: Use identical discrete-time process noise as ESKF
+        // ==============================================================
+        Mat15 Qd = make_Qd_ukf(dt);
+        P_pred = mat15_add(P_pred, Qd);
+        P_pred = mat15_symmetrize(P_pred);
 
         // Update nominal state
         s.R=R_pred_nom; s.q=q_pred_nom;
         s.p=p_pred_nom; s.v=v_pred_nom;
         s.P=P_pred;
 
-        // ─── ZUPT + Gravity ────────────────────────────────────────────────
+        // ─── ZUPT + Gravity (identical to ESKF) ─────────────────────────────
         ukf_zupt(s,omega,acc);
         ukf_gravity(s,acc);
 
-        // ─── Camera update ─────────────────────────────────────────────────
+        // ─── Camera update (6-DOF) ─────────────────────────────────────────
         double t_curr=ad.imu_t[idx];
         if(cam_idx<N_cam && t_curr>=ad.cam_t[cam_idx]){
             Vec3 vo_p=ad.cam_pos[cam_idx]+sigma_pos_vo*rng.randn3();
             Mat3 gt_R=quat2rotm(ad.cam_quat[cam_idx]);
             Mat3 vo_R=gt_R*expm_so3(sigma_ori_vo*rng.randn3());
 
-            // Combined 6-DOF update (orientation + position)
-            // z = [angle_error(3); pos_innov(3)]
             Mat3 R_err=transpose(s.R)*vo_R;
             Vec3 ang_err=rotm_to_axis_angle(R_err);
             Vec3 pos_inn=vo_p-s.p;
 
             H6 H6m{};
-            // H_ori: rows 0-2, cols 0-2 = I
             H6m[0][0]=1; H6m[1][1]=1; H6m[2][2]=1;
-            // H_pos: rows 3-5, cols 3-5 = I
             H6m[3][3]=1; H6m[4][4]=1; H6m[5][5]=1;
 
             double so2=sigma_ori_vo*sigma_ori_vo;
@@ -353,7 +323,6 @@ inline FilterResult run_full_ukf(const AlignedData& ad){
             Mat6 S6=mat_HPH6(H6m,s.P);
             for(int i=0;i<3;i++) S6.m[i][i]+=so2;
             for(int i=3;i<6;i++) S6.m[i][i]+=sp2;
-            // symmetrize
             for(int i=0;i<6;i++) for(int j=0;j<6;j++)
                 S6.m[i][j]=(S6.m[i][j]+S6.m[j][i])/2;
             for(int i=0;i<6;i++) S6.m[i][i]+=1e-6;
@@ -366,7 +335,6 @@ inline FilterResult run_full_ukf(const AlignedData& ad){
                                          pos_inn[0],pos_inn[1],pos_inn[2]};
             Vec15 dx=mat_Kinnov6(K6,innov6);
 
-            // Apply
             Vec3 dphi={dx[0],dx[1],dx[2]};
             s.R=s.R*expm_so3(dphi);
             s.q=rotm2quat(s.R);
